@@ -12,6 +12,12 @@ from analysis.visualize_archive import (
     visualize_archive_single,
     visualize_archive_together,
 )
+from hyperagents.core.runner import (
+    CandidateResult,
+    candidate_state_from_metadata,
+    ensure_run_success,
+    Runner,
+)
 
 from utils.common import file_exist_and_not_empty, load_json_file
 from utils.constants import REPO_NAME
@@ -716,6 +722,22 @@ def generate(
     return metadata
 
 
+def metadata_to_candidate_result(current_genid, parent_genid, metadata):
+    return CandidateResult(
+        candidate_id=current_genid,
+        generation=current_genid if isinstance(current_genid, int) else 0,
+        parent_id=parent_genid,
+        state=candidate_state_from_metadata(
+            parent_agent_success=metadata.get("parent_agent_success", True),
+            run_eval=metadata.get("run_eval", False),
+            run_full_eval=metadata.get("run_full_eval", False),
+            valid_parent=metadata.get("valid_parent", False),
+        ),
+        valid_parent=metadata.get("valid_parent", False),
+        metadata=metadata,
+    )
+
+
 def generate_loop(
     domains,
     run_id=None,
@@ -885,54 +907,38 @@ def generate_loop(
         args_str = ", ".join([f"{k}={v}" for k, v in args_dict.items()])
         f.write(f"Args: {args_str}\n")
 
-    # Run generations
-    start_genid = len(archive)
-    if not edit_select_parent or run_baseline == "no_archive":
-        parent_genid = select_parent(archive, output_dir, domains, method=parent_selection)
-    else:
-        parent_genid = select_next_parent_container(
+    def select_parent_from_archive(archive_state):
+        if not edit_select_parent or run_baseline == "no_archive":
+            return select_parent(archive_state, output_dir, domains, method=parent_selection)
+        return select_next_parent_container(
             docker_client,
             domains,
             output_dir,
-            archive,
-            root_dir, root_commit,
-        )
-    for current_genid in range(start_genid, max_generation + 1):
-        metadata = generate(
-            docker_client,
-            [d for d in domains if d != "polyglot"],
-            output_dir,
-            run_id,
-            current_genid,
-            parent_genid=parent_genid,
-            root_dir=root_dir,
-            root_commit=root_commit,
-            eval_samples=eval_samples,
-            eval_workers=eval_workers,
-            eval_subsets=eval_subsets,
-            meta_patch_files=meta_patch_files,
-            run_meta_agent=True,
-            run_baseline=run_baseline,
-            optimize_option=optimize_option,
-            agent_archive_path=agent_archive_path,
-            eval_test=eval_test,
-            skip_staged_eval=skip_staged_eval,
-            edit_select_parent=edit_select_parent,
-            max_generation=max_generation,
+            archive_state,
+            root_dir,
+            root_commit,
         )
 
-        # NOTE: need to update and save archive before running ensembling eval
-        archive = update_and_save_archive(output_dir, archive, new_node=current_genid)
+    def record_candidate(archive_state, result):
+        return update_and_save_archive(output_dir, archive_state, new_node=result.candidate_id)
 
-        # Parent agent failed, update the metadata in the parent node
-        if not metadata["parent_agent_success"]:
-            update_node_metadata(output_dir, parent_genid, {"valid_parent": False})
+    def handle_parent_failure(selected_parent, result):
+        if selected_parent is not None and not result.metadata.get("parent_agent_success", True):
+            update_node_metadata(output_dir, selected_parent, {"valid_parent": False})
 
-        # Evaluate the agent on polyglot if needed
+    def post_generation(result):
+        current_genid = result.candidate_id
+        metadata = result.metadata
+
         if "polyglot" in domains:
-            run_harness_polyglot(root_dir, output_dir, current_genid, skip_staged_eval=skip_staged_eval, num_samples=eval_samples[domains.index("polyglot")])
+            run_harness_polyglot(
+                root_dir,
+                output_dir,
+                current_genid,
+                skip_staged_eval=skip_staged_eval,
+                num_samples=eval_samples[domains.index("polyglot")],
+            )
 
-        # Evaluate the entire archive as an ensemble
         eval_ensemble = (
             "ensemble" in optimize_option
             and all(can_domain_ensembled(domain) for domain in domains)
@@ -965,8 +971,6 @@ def generate_loop(
                     ],
                 )
 
-        # Make analysis plots
-        # Per-domain plots
         for domain in domains:
             splits = get_domain_splits(domain)
             if optimize_option == "only_ensemble":
@@ -982,7 +986,6 @@ def generate_loop(
                         domain, output_dir, split=split, type=stype
                     )
 
-        # Combined together plots across all domains (if there is more than one domain)
         if len(domains) > 1:
             domain_splits_sets = [set(get_domain_splits(d)) for d in domains]
             common_splits = (
@@ -1003,20 +1006,49 @@ def generate_loop(
                         domains, output_dir, split=split, type=stype
                     )
 
-        # Select next parent
-        parent_genid = None
-        if not edit_select_parent or run_baseline == "no_archive":
-            parent_genid = select_parent(archive, output_dir, domains, method=parent_selection)
-        else:
-            parent_genid = select_next_parent_container(
-                docker_client,
-                domains,
-                output_dir,
-                archive,
-                root_dir, root_commit,
-            )
+    def execute_generation(current_genid, parent_genid):
+        metadata = generate(
+            docker_client,
+            [d for d in domains if d != "polyglot"],
+            output_dir,
+            run_id,
+            current_genid,
+            parent_genid=parent_genid,
+            root_dir=root_dir,
+            root_commit=root_commit,
+            eval_samples=eval_samples,
+            eval_workers=eval_workers,
+            eval_subsets=eval_subsets,
+            meta_patch_files=meta_patch_files,
+            run_meta_agent=True,
+            run_baseline=run_baseline,
+            optimize_option=optimize_option,
+            agent_archive_path=agent_archive_path,
+            eval_test=eval_test,
+            skip_staged_eval=skip_staged_eval,
+            edit_select_parent=edit_select_parent,
+            max_generation=max_generation,
+        )
+        return metadata_to_candidate_result(current_genid, parent_genid, metadata)
 
-        print(f"generate_loop: generation {current_genid} completed, parent {parent_genid}")
+    start_genid = len(archive)
+    runner = Runner(
+        config={"run_id": run_id},
+        archive=archive,
+        sandbox=docker_client,
+        domains=domains,
+        meta_agent="meta_agent",
+        events=None,
+        parent_selector=select_parent_from_archive,
+        generation_executor=execute_generation,
+        archive_recorder=record_candidate,
+        post_generation_hook=post_generation,
+        parent_failure_handler=handle_parent_failure,
+    )
+    runner.initialize_run()
+    ensure_run_success(
+        runner.run(start_generation=start_genid, max_generation=max_generation)
+    )
 
     # Return output dir
     return output_dir
