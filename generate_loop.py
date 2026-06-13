@@ -18,6 +18,11 @@ from hyperagents.core.runner import (
     ensure_run_success,
     Runner,
 )
+from hyperagents.config import (
+    load_config,
+    resolved_config_to_legacy_kwargs,
+    save_resolved_config,
+)
 
 from utils.common import file_exist_and_not_empty, load_json_file
 from utils.constants import REPO_NAME
@@ -1056,6 +1061,12 @@ def generate_loop(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
+    parser.add_argument(
+        "--config",
+        type=str,
+        default=None,
+        help="Path to a YAML experiment config",
+    )
     parser.add_argument("--run_id", type=str, default=None, help="Run ID")
     parser.add_argument(
         "--domains",
@@ -1075,7 +1086,7 @@ if __name__ == "__main__":
             "imo_grading",
             "imo_proof",
         ],
-        required=True,
+        required=False,
         help="One or more domains to evaluate (must be from the allowed list)",
     )
     parser.add_argument(
@@ -1185,37 +1196,52 @@ if __name__ == "__main__":
     )
     args = parser.parse_args()
 
-    # Post-parse validation
-    if args.optimize_option == "only_ensemble" and args.agent_archive_path is None:
-        parser.error(
-            "--agent_archive_path is required when --optimize_option=only_ensemble"
-        )
-    if args.eval_samples is None:
-        eval_samples = [-1] * len(args.domains)
-    elif len(args.eval_samples) == len(args.domains):
-        eval_samples = args.eval_samples
+    output_dir = None
+    if args.config is not None:
+        overrides = {
+            "experiment.run_id": args.run_id,
+            "legacy.output_dir_parent": args.output_dir_parent,
+            "legacy.resume_from": args.resume_from,
+            "legacy.copy_root_dir": args.copy_root_dir,
+            "legacy.agent_archive_path": args.agent_archive_path,
+        }
+        resolved_config = load_config(args.config, overrides=overrides)
+        generate_kwargs = resolved_config_to_legacy_kwargs(resolved_config)
+        output_dir = generate_loop(**generate_kwargs)
+        save_resolved_config(os.path.join(output_dir, "config.yaml"), resolved_config)
     else:
-        parser.error("--eval_samples must be a one per domain if provided")
+        if not args.domains:
+            parser.error("--domains is required unless --config is provided")
+        if args.optimize_option == "only_ensemble" and args.agent_archive_path is None:
+            parser.error(
+                "--agent_archive_path is required when --optimize_option=only_ensemble"
+            )
+        if args.eval_samples is None:
+            eval_samples = [-1] * len(args.domains)
+        elif len(args.eval_samples) == len(args.domains):
+            eval_samples = args.eval_samples
+        else:
+            parser.error("--eval_samples must be a one per domain if provided")
 
-    eval_subsets = [get_domain_eval_subset(d) for d in args.domains]
-    output_dir = generate_loop(
-        domains=args.domains,
-        run_id=args.run_id,
-        max_generation=args.max_generation,
-        eval_samples=eval_samples,
-        eval_workers=args.eval_workers,
-        eval_subsets=eval_subsets,
-        parent_selection=args.parent_selection,
-        resume_from=args.resume_from,
-        output_dir_parent=args.output_dir_parent,
-        meta_patch_files=args.meta_patch_files,
-        reset_task_agent=args.reset_task_agent,
-        reset_meta_agent=args.reset_meta_agent,
-        copy_root_dir=args.copy_root_dir,
-        run_baseline=args.run_baseline,
-        optimize_option=args.optimize_option,
-        agent_archive_path=args.agent_archive_path,
-        eval_test=args.eval_test,
-        skip_staged_eval=args.skip_staged_eval,
-        edit_select_parent=args.edit_select_parent,
-    )
+        eval_subsets = [get_domain_eval_subset(d) for d in args.domains]
+        output_dir = generate_loop(
+            domains=args.domains,
+            run_id=args.run_id,
+            max_generation=args.max_generation,
+            eval_samples=eval_samples,
+            eval_workers=args.eval_workers,
+            eval_subsets=eval_subsets,
+            parent_selection=args.parent_selection,
+            resume_from=args.resume_from,
+            output_dir_parent=args.output_dir_parent,
+            meta_patch_files=args.meta_patch_files,
+            reset_task_agent=args.reset_task_agent,
+            reset_meta_agent=args.reset_meta_agent,
+            copy_root_dir=args.copy_root_dir,
+            run_baseline=args.run_baseline,
+            optimize_option=args.optimize_option,
+            agent_archive_path=args.agent_archive_path,
+            eval_test=args.eval_test,
+            skip_staged_eval=args.skip_staged_eval,
+            edit_select_parent=args.edit_select_parent,
+        )
