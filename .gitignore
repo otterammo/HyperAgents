@@ -1,2 +1,6 @@
 outputs/
 outputs_os/
+
+# Python cache artifacts
+__pycache__/
+*.py[cod]
